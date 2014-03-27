@@ -1,19 +1,25 @@
-cgminer
-cgminer.exe
+sgminer
+sgminer.exe
 minerd
 minerd.exe
 *.o
 *.lo
 *.bin
+*.la
+*.pc
 
 autom4te.cache
 .deps
+.libs
 
 Makefile
 Makefile.in
 INSTALL
 aclocal.m4
+m4
 configure
+libtool
+ltmain.sh
 depcomp
 missing
 install-sh
@@ -34,6 +40,7 @@ config.h.in
 config.h
 
 ccan/libccan.a
+ccan/opt/.dirstamp
 lib/arg-nonnull.h
 lib/c++defs.h
 lib/libgnu.a
@@ -41,6 +48,8 @@ lib/signal.h
 lib/string.h
 lib/stdint.h
 lib/warn-on-use.h
+compat/jansson-2.5/src/jansson_config.h
+stamp-h1
 
 mkinstalldirs
 

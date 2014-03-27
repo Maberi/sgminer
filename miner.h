@@ -33,6 +33,10 @@ extern char *curly;
 # include <netdb.h>
 #endif
 
+#ifdef USE_USBUTILS
+#include <semaphore.h>
+#endif
+
 #ifdef __APPLE_CC__
 #include <OpenCL/opencl.h>
 #else
@@ -122,6 +126,14 @@ static inline int fsync (int fd)
 
 #ifdef HAVE_ADL
  #include "ADL_SDK/adl_sdk.h"
+#endif
+
+#ifdef USE_USBUTILS
+  #include <libusb.h>
+#endif
+
+#ifdef USE_USBUTILS
+  #include "usbutils.h"
 #endif
 
 #if (!defined(WIN32) && ((__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 3))) \
@@ -223,11 +235,15 @@ static inline int fsync (int fd)
 #define MAX(x, y)	((x) > (y) ? (x) : (y))
 #endif
 
+#define ASIC_PARSE_COMMANDS(DRIVER_ADD_COMMAND) \
+	DRIVER_ADD_COMMAND(gridseed)
+
 /* Adding a device here will update all macros in the code that use
  * the *_PARSE_COMMANDS macros for each listed driver.
  */
 #define DRIVER_PARSE_COMMANDS(DRIVER_ADD_COMMAND) \
-	DRIVER_ADD_COMMAND(opencl)
+	DRIVER_ADD_COMMAND(opencl) \
+	ASIC_PARSE_COMMANDS(DRIVER_ADD_COMMAND)
 
 #define DRIVER_ENUM(X) DRIVER_##X,
 #define DRIVER_PROTOTYPE(X) struct device_drv X##_drv;
@@ -445,7 +461,10 @@ struct cgpu_info {
 	char *name;  /* GPU family codename. */
 	char *device_path;
 	void *device_data;
-
+#ifdef USE_USBUTILS
+	struct cg_usb_device *usbdev;
+	struct cg_usb_info usbinfo;
+#endif
 	enum dev_enable deven;
 	int accepted;
 	int rejected;
@@ -977,6 +996,15 @@ extern bool opt_delaynet;
 extern time_t last_getwork;
 extern bool opt_restart;
 extern bool opt_worktime;
+#ifdef USE_GRIDSEED
+extern char *opt_gridseed_options;
+#endif
+#ifdef USE_USBUTILS
+extern char *opt_usb_select;
+extern int opt_usbdump;
+extern bool opt_usb_list_all;
+extern cgsem_t usb_resource_sem;
+#endif
 extern int swork_id;
 extern int opt_tcp_keepalive;
 extern bool opt_incognito;
@@ -1012,6 +1040,12 @@ extern bool fulltest(const unsigned char *hash, const unsigned char *target);
 extern int opt_queue;
 extern int opt_scantime;
 extern int opt_expiry;
+
+#ifdef USE_USBUTILS
+extern pthread_mutex_t cgusb_lock;
+extern pthread_mutex_t cgusbres_lock;
+extern cglock_t cgusb_fd_lock;
+#endif
 
 extern char *opt_algorithm;
 extern algorithm_t *algorithm;

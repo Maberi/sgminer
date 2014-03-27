@@ -29,6 +29,10 @@
 #include <signal.h>
 #include <limits.h>
 
+#ifdef USE_USBUTILS
+#include <semaphore.h>
+#endif
+
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -58,6 +62,9 @@ char *curly = ":D";
 #include "algorithm.h"
 #include "scrypt.h"
 #include "pool.h"
+#ifdef USE_USBUTILS
+#include "usbutils.h"
+#endif
 
 #if defined(unix) || defined(__APPLE__)
 	#include <errno.h>
@@ -82,7 +89,6 @@ static char packagename[256];
 
 bool opt_work_update;
 bool opt_protocol;
-static bool opt_benchmark;
 bool have_longpoll;
 bool want_per_device_stats;
 bool use_syslog;
@@ -111,6 +117,7 @@ int opt_dynamic_interval = 7;
 int opt_g_threads = -1;
 int gpu_threads;
 bool opt_restart = true;
+bool opt_nogpu;
 
 struct list_head scan_devices;
 static bool devices_enabled[MAX_DEVICES];
@@ -153,10 +160,21 @@ bool opt_delaynet;
 bool opt_disable_pool;
 static bool no_work;
 bool opt_worktime;
+#ifdef USE_GRIDSEED
+char *opt_gridseed_options = NULL;
+#endif
 #if defined(HAVE_LIBCURL) && defined(CURL_HAS_KEEPALIVE)
 int opt_tcp_keepalive = 30;
 #else
 int opt_tcp_keepalive;
+#endif
+#ifdef USE_USBUTILS
+char *opt_usb_select = NULL;
+int opt_usbdump = -1;
+bool opt_usb_list_all;
+cgsem_t usb_resource_sem;
+static pthread_t usb_poll_thread;
+static bool usb_polling;
 #endif
 
 char *opt_kernel_path;
@@ -174,6 +192,10 @@ static int input_thr_id;
 #endif
 int gpur_thr_id;
 static int api_thr_id;
+#ifdef USE_USBUTILS
+static int usbres_thr_id;
+static int hotplug_thr_id;
+#endif
 static int total_control_threads;
 bool hotplug_mode;
 static int new_devices;
@@ -182,6 +204,12 @@ int hotplug_time = 5;
 
 #if LOCK_TRACKING
 pthread_mutex_t lockstat_lock;
+#endif
+
+#ifdef USE_USBUTILS
+pthread_mutex_t cgusb_lock;
+pthread_mutex_t cgusbres_lock;
+cglock_t cgusb_fd_lock;
 #endif
 
 pthread_mutex_t hash_lock;
@@ -1080,6 +1108,24 @@ static char *set_api_mcast_des(const char *arg)
 	return NULL;
 }
 
+#ifdef USE_GRIDSEED
+static char *set_gridseed_options(const char *arg)
+{
+	opt_set_charp(arg, &opt_gridseed_options);
+
+	return NULL;
+}
+#endif
+
+#ifdef USE_USBUTILS
+static char *set_usb_select(const char *arg)
+{
+	opt_set_charp(arg, &opt_usb_select);
+
+	return NULL;
+}
+#endif
+
 static char *set_null(const char __maybe_unused *arg)
 {
 	return NULL;
@@ -1134,9 +1180,6 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITHOUT_ARG("--balance",
 		     set_balance, &pool_strategy,
 		     "Change multipool strategy from failover to even share balance"),
-	OPT_WITHOUT_ARG("--benchmark",
-			opt_set_bool, &opt_benchmark,
-			"Run sgminer in benchmark mode - produces no shares"),
 #ifdef HAVE_CURSES
 	OPT_WITHOUT_ARG("--compact",
 			opt_set_bool, &opt_compact,
@@ -1148,6 +1191,8 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITH_ARG("--device|-d",
 		     set_devices, NULL, NULL,
 	             "Select device to use, one value, range and/or comma separated (e.g. 0-2,4) default: all"),
+	OPT_WITHOUT_ARG("--disable-gpu|-G",
+			opt_set_bool, &opt_nogpu, "Disable GPU mining even if suitable devices exist"),
 	OPT_WITHOUT_ARG("--disable-rejecting",
 			opt_set_bool, &opt_disable_pool,
 			"Automatically disable pools that continually reject shares"),
@@ -1224,12 +1269,25 @@ static struct opt_table opt_config_table[] = {
 		     set_rawintensity, NULL, NULL,
 		     "Raw intensity of GPU scanning (" MIN_RAWINTENSITY_STR " to "
 			 MAX_RAWINTENSITY_STR "), overrides --intensity|-I and --xintensity|-X."),
+	OPT_WITH_ARG("--hotplug",
+		     set_int_0_to_9999, NULL, &hotplug_time,
+#ifdef USE_USBUTILS
+		     "Seconds between hotplug checks (0 means never check)"
+#else
+		     opt_hidden
+#endif
+		    ),
 	OPT_WITH_ARG("--kernel-path|-K",
 		     opt_set_charp, opt_show_charp, &opt_kernel_path,
 	             "Specify a path to where kernel files are"),
 	OPT_WITH_ARG("--kernel|-k",
 		     set_kernel, NULL, NULL,
 		     "Override kernel to use - one value or comma separated"),
+#ifdef USE_GRIDSEED
+	OPT_WITH_ARG("--gridseed-options",
+		     set_gridseed_options, NULL, NULL,
+		     opt_hidden),
+#endif
 	OPT_WITHOUT_ARG("--load-balance",
 			set_loadbalance, &pool_strategy,
 			"Change multipool strategy from failover to quota based balance"),
@@ -1382,6 +1440,17 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITH_ARG("--user|-u",
 		     set_user, NULL, NULL,
 		     "Username for bitcoin JSON-RPC server"),
+#ifdef USE_USBUTILS
+	OPT_WITH_ARG("--usb",
+		     set_usb_select, NULL, NULL,
+		     "USB device selection"),
+	OPT_WITH_ARG("--usb-dump",
+		     set_int_0_to_10, opt_show_intval, &opt_usbdump,
+		     opt_hidden),
+	OPT_WITHOUT_ARG("--usb-list-all",
+			opt_set_bool, &opt_usb_list_all,
+			opt_hidden),
+#endif
 	OPT_WITH_ARG("--vectors",
 		     set_vector, NULL, NULL,
 		     opt_hidden),
@@ -1551,7 +1620,12 @@ extern const char *opt_argv0;
 
 static char *opt_verusage_and_exit(const char *extra)
 {
-	printf("%s\n", packagename);
+	printf("%s\nBuilt with GPU "
+#ifdef USE_GRIDSEED
+		"GridSeed "
+#endif
+	       "mining support.\n"
+	       , packagename);
 	printf("%s", opt_usage(opt_argv0, extra));
 	fflush(stdout);
 	exit(0);
@@ -1561,6 +1635,9 @@ char *display_devs(int *ndevs)
 {
 	*ndevs = 0;
 	print_ndevs(ndevs);
+#ifdef USE_USBUTILS
+	usb_all(0);
+#endif
 	exit(*ndevs);
 }
 
@@ -1579,8 +1656,11 @@ static struct opt_table opt_cmdline_table[] = {
 			"Print this message"),
 	OPT_WITHOUT_ARG("--ndevs|-n",
 			display_devs, &nDevs,
-			"Display number of detected GPUs, OpenCL platform "
-			"information, and exit"),
+			"Display number of detected GPUs, OpenCL platform information"
+#ifdef USE_USBUTILS
+			", all USB devices"
+#endif
+			" and exit"),
 	OPT_WITHOUT_ARG("--version|-V",
 			opt_version_and_exit, packagename,
 			"Display version and exit"),
@@ -2281,6 +2361,11 @@ static void curses_print_devstatus(struct cgpu_info *cgpu, int count)
 	suffix_string(dh64, displayed_hashes, sizeof(displayed_hashes), 4);
 	suffix_string(dr64, displayed_rolling, sizeof(displayed_rolling), 4);
 
+#ifdef USE_USBUTILS
+	if (cgpu->usbinfo.nodev)
+		cg_wprintw(statuswin, "ZOMBIE");
+	else
+#endif
 	if (cgpu->status == LIFE_DEAD)
 		cg_wprintw(statuswin, "DEAD  ");
 	else if (cgpu->status == LIFE_SICK)
@@ -3145,6 +3230,14 @@ static void __kill_work(void)
 
 	forcelog(LOG_INFO, "Received kill message");
 
+#ifdef USE_USBUTILS
+	/* Best to get rid of it first so it doesn't
+	 * try to create any new devices */
+	forcelog(LOG_DEBUG, "Killing off HotPlug thread");
+	thr = &control_thr[hotplug_thr_id];
+	kill_timeout(thr);
+#endif
+
 	forcelog(LOG_DEBUG, "Killing off watchpool thread");
 	/* Kill the watchpool thread */
 	thr = &control_thr[watchpool_thr_id];
@@ -3177,6 +3270,18 @@ static void __kill_work(void)
 	forcelog(LOG_DEBUG, "Killing off API thread");
 	thr = &control_thr[api_thr_id];
 	kill_timeout(thr);
+
+#ifdef USE_USBUTILS
+	/* Release USB resources in case it's a restart
+	 * and not a QUIT */
+	forcelog(LOG_DEBUG, "Releasing all USB devices");
+	cg_completion_timeout(&usb_cleanup, NULL, 1000);
+
+	forcelog(LOG_DEBUG, "Killing off usbres thread");
+	thr = &control_thr[usbres_thr_id];
+	kill_timeout(thr);
+#endif
+
 }
 
 /* This should be the common exit path */
@@ -3564,9 +3669,6 @@ static bool stale_work(struct work *work, bool share)
 	struct pool *pool;
 	int getwork_delay;
 
-	if (opt_benchmark)
-		return false;
-
 	if (work->work_block != work_block) {
 		applog(LOG_DEBUG, "Work stale due to block mismatch");
 		return true;
@@ -3873,6 +3975,12 @@ static void *restart_thread(void __maybe_unused *arg)
 	pthread_cond_broadcast(&restart_cond);
 	mutex_unlock(&restart_lock);
 
+#ifdef USE_USBUTILS
+	/* Cancels any cancellable usb transfers. Flagged as such it means they
+	 * are usualy waiting on a read result and it's safe to abort the read
+	 * early. */
+	cancel_usb_transfers();
+#endif
 	return NULL;
 }
 
@@ -4410,7 +4518,14 @@ void write_config(FILE *fcfg)
 		fprintf(fcfg, ",\n\"api-description\" : \"%s\"", json_escape(opt_api_description));
 	if (opt_api_groups)
 		fprintf(fcfg, ",\n\"api-groups\" : \"%s\"", json_escape(opt_api_groups));
-
+#ifdef USE_GRIDSEED
+	if (opt_gridseed_options)
+		fprintf(fcfg, ",\n\"gridseed-options\" : \"%s\"", json_escape(opt_gridseed_options));
+#endif
+#ifdef USE_USBUTILS
+	if (opt_usb_select)
+		fprintf(fcfg, ",\n\"usb\" : \"%s\"", json_escape(opt_usb_select));
+#endif
 	fputs("\n}\n", fcfg);
 
 	json_escape_free();
@@ -6985,8 +7100,7 @@ static void *watchpool_thread(void __maybe_unused *userdata)
 		for (i = 0; i < total_pools; i++) {
 			struct pool *pool = pools[i];
 
-			if (!opt_benchmark)
-				reap_curl(pool);
+			reap_curl(pool);
 
 			/* Get a rolling utility per pool over 10 mins */
 			if (intervals > 19) {
@@ -7082,10 +7196,21 @@ static void *watchdog_thread(void __maybe_unused *userdata)
 				count = 0;
 				for (i = 0; i < total_devices; i++) {
 					cgpu = get_devices(i);
-					if (cgpu) curses_print_devstatus(cgpu, count++);
+#ifndef USE_USBUTILS
+					if (cgpu)
+#else
+					if (cgpu && !cgpu->usbinfo.nodev)
+#endif
+					    curses_print_devstatus(cgpu, count++);
 				}
 			}
-
+#ifdef USE_USBUTILS
+			for (i = 0; i < total_devices; i++) {
+				cgpu = get_devices(i);
+				if (cgpu && cgpu->usbinfo.nodev)
+					curses_print_devstatus(cgpu, count++);
+			}
+#endif
 			touchwin(statuswin);
 			wrefresh(statuswin);
 			touchwin(logwin);
@@ -7314,6 +7439,12 @@ static void clean_up(bool restarting)
 #ifdef HAVE_ADL
 	clear_adl(nDevs);
 #endif
+#ifdef USE_USBUTILS
+	usb_polling = false;
+	int err = pthread_join(usb_poll_thread, NULL);
+	libusb_exit(NULL);
+#endif
+
 	cgtime(&total_tv_end);
 #ifdef WIN32
 	timeEndPeriod(1);
@@ -7763,6 +7894,111 @@ struct device_drv *copy_drv(struct device_drv *drv)
 	return copy;
 }
 
+#ifdef USE_USBUTILS
+static void hotplug_process(void)
+{
+	struct thr_info *thr;
+	int i, j;
+
+	for (i = 0; i < new_devices; i++) {
+		struct cgpu_info *cgpu;
+		int dev_no = total_devices + i;
+
+		cgpu = devices[dev_no];
+		if (!opt_devs_enabled || (opt_devs_enabled && devices_enabled[dev_no]))
+			enable_device(cgpu);
+		cgpu->sgminer_stats.getwork_wait_min.tv_sec = MIN_SEC_UNSET;
+		cgpu->rolling = cgpu->total_mhashes = 0;
+	}
+
+	wr_lock(&mining_thr_lock);
+	mining_thr = realloc(mining_thr, sizeof(thr) * (mining_threads + new_threads + 1));
+
+	if (!mining_thr)
+		quit(1, "Failed to hotplug realloc mining_thr");
+	for (i = 0; i < new_threads; i++) {
+		mining_thr[mining_threads + i] = calloc(1, sizeof(*thr));
+		if (!mining_thr[mining_threads + i])
+			quit(1, "Failed to hotplug calloc mining_thr[%d]", i);
+	}
+
+	// Start threads
+	for (i = 0; i < new_devices; ++i) {
+		struct cgpu_info *cgpu = devices[total_devices];
+		cgpu->thr = malloc(sizeof(*cgpu->thr) * (cgpu->threads+1));
+		cgpu->thr[cgpu->threads] = NULL;
+		cgpu->status = LIFE_INIT;
+		cgtime(&(cgpu->dev_start_tv));
+
+		for (j = 0; j < cgpu->threads; ++j) {
+			thr = __get_thread(mining_threads);
+			thr->id = mining_threads;
+			thr->cgpu = cgpu;
+			thr->device_thread = j;
+
+			if (cgpu->drv->thread_prepare && !cgpu->drv->thread_prepare(thr))
+				continue;
+
+			if (unlikely(thr_info_create(thr, NULL, miner_thread, thr)))
+				quit(1, "hotplug thread %d create failed", thr->id);
+
+			cgpu->thr[j] = thr;
+
+			/* Enable threads for devices set not to mine but disable
+			 * their queue in case we wish to enable them later */
+			if (cgpu->deven != DEV_DISABLED) {
+				applog(LOG_DEBUG, "Pushing sem post to thread %d", thr->id);
+				cgsem_post(&thr->sem);
+			}
+
+			mining_threads++;
+		}
+		total_devices++;
+		applog(LOG_WARNING, "Hotplug: %s added %s %i", cgpu->drv->dname, cgpu->drv->name, cgpu->device_id);
+	}
+	wr_unlock(&mining_thr_lock);
+
+	adjust_mostdevs();
+	switch_logsize(true);
+}
+
+#define DRIVER_DRV_DETECT_HOTPLUG(X) X##_drv.drv_detect(true);
+
+static void *hotplug_thread(void __maybe_unused *userdata)
+{
+	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+
+	RenameThread("hotplug");
+
+	hotplug_mode = true;
+
+	cgsleep_ms(5000);
+
+	while (0x2a) {
+// Version 0.1 just add the devices on - worry about using nodev later
+
+		if (hotplug_time == 0)
+			cgsleep_ms(5000);
+		else {
+			new_devices = 0;
+			new_threads = 0;
+
+			/* Use the DRIVER_PARSE_COMMANDS macro to detect all
+			 * devices */
+			DRIVER_PARSE_COMMANDS(DRIVER_DRV_DETECT_HOTPLUG)
+
+			if (new_devices)
+				hotplug_process();
+
+			// hotplug_time >0 && <=9999
+			cgsleep_ms(hotplug_time * 1000);
+		}
+	}
+
+	return NULL;
+}
+#endif
+
 static void probe_pools(void)
 {
 	int i;
@@ -7777,6 +8013,45 @@ static void probe_pools(void)
 
 #define DRIVER_FILL_DEVICE_DRV(X) fill_device_drv(&X##_drv);
 #define DRIVER_DRV_DETECT_ALL(X) X##_drv.drv_detect(false);
+
+#ifdef USE_USBUTILS
+static void *libusb_poll_thread(void __maybe_unused *arg)
+{
+	struct timeval tv_end = {1, 0};
+
+	RenameThread("usbpoll");
+
+	while (usb_polling)
+		libusb_handle_events_timeout_completed(NULL, &tv_end, NULL);
+
+	/* Cancel any cancellable usb transfers */
+	cancel_usb_transfers();
+
+	/* Keep event handling going until there are no async transfers in
+	 * flight. */
+	do {
+		libusb_handle_events_timeout_completed(NULL, &tv_end, NULL);
+	} while (async_usb_transfers());
+
+	return NULL;
+}
+
+static void initialise_usb(void) {
+	int err = libusb_init(NULL);
+	if (err) {
+		fprintf(stderr, "libusb_init() failed err %d", err);
+		fflush(stderr);
+		quit(1, "libusb_init() failed");
+	}
+	mutex_init(&cgusb_lock);
+	mutex_init(&cgusbres_lock);
+	cglock_init(&cgusb_fd_lock);
+	usb_polling = true;
+	pthread_create(&usb_poll_thread, NULL, libusb_poll_thread, NULL);
+}
+#else
+#define initialise_usb() {}
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -7800,7 +8075,7 @@ int main(int argc, char *argv[])
 		quithere(1, "Failed to pthread_mutex_init lockstat_lock errno=%d", errno);
 #endif
 
-	initial_args = (const char **)malloc(sizeof(char *)* (argc + 1));
+	initial_args = (char **)malloc(sizeof(char *)* (argc + 1));
 	for  (i = 0; i < argc; i++)
 		initial_args[i] = strdup(argv[i]);
 	initial_args[argc] = NULL;
@@ -7827,6 +8102,8 @@ int main(int argc, char *argv[])
 
 	if (unlikely(pthread_cond_init(&gws_cond, NULL)))
 		quit(1, "Failed to pthread_cond_init gws_cond");
+
+	initialise_usb();
 
 	/* Create a unique get work queue */
 	getq = tq_new();
@@ -7902,21 +8179,6 @@ int main(int argc, char *argv[])
 	if (!config_loaded)
 		load_default_config();
 
-	if (opt_benchmark) {
-		struct pool *pool;
-
-		// FIXME: executes always (leftover from SHA256d days)
-		quit(1, "Cannot use benchmark mode with scrypt");
-		pool = add_pool();
-		pool->rpc_url = (char *)malloc(255);
-		strcpy(pool->rpc_url, "Benchmark");
-		pool->rpc_user = pool->rpc_url;
-		pool->rpc_pass = pool->rpc_url;
-		enable_pool(pool);
-		pool->idle = false;
-		successful_connect = true;
-	}
-
 #ifdef HAVE_CURSES
 	if (opt_realquiet || opt_display_devs)
 		use_curses = false;
@@ -7957,10 +8219,25 @@ int main(int argc, char *argv[])
 
 	gwsched_thr_id = 0;
 
+#ifdef USE_USBUTILS
+	usb_initialise();
+
+	// before device detection
+	cgsem_init(&usb_resource_sem);
+	usbres_thr_id = 1;
+	thr = &control_thr[usbres_thr_id];
+	if (thr_info_create(thr, NULL, usb_resource_thread, thr))
+		quit(1, "usb resource thread create failed");
+	pthread_detach(thr->pth);
+#endif
+
 	/* Use the DRIVER_PARSE_COMMANDS macro to fill all the device_drvs */
 	DRIVER_PARSE_COMMANDS(DRIVER_FILL_DEVICE_DRV)
 
 	opencl_drv.drv_detect(false);
+#ifdef USE_GRIDSEED
+	gridseed_drv.drv_detect(false);
+#endif
 
 	if (opt_display_devs) {
 		applog(LOG_ERR, "Devices detected:");
@@ -7993,8 +8270,15 @@ int main(int argc, char *argv[])
 			enable_device(devices[i]);
 	}
 
+#ifdef USE_USBUTILS
+	if (!total_devices) {
+		applog(LOG_WARNING, "No devices detected!");
+		applog(LOG_WARNING, "Waiting for USB hotplug devices or press q to quit");
+	}
+#else
 	if (!total_devices)
 		quit(1, "All devices disabled, cannot mine!");
+#endif
 
 	most_devices = total_devices;
 
@@ -8049,12 +8333,12 @@ int main(int argc, char *argv[])
 		openlog(PACKAGE, LOG_PID, LOG_USER);
 #endif
 
-	#if defined(unix) || defined(__APPLE__)
-		if (opt_stderr_cmd)
-			fork_monitor();
-	#endif // defined(unix)
+#if defined(unix) || defined(__APPLE__)
+	if (opt_stderr_cmd)
+	    fork_monitor();
+#endif // defined(unix)
 
-		mining_thr = (struct thr_info **)calloc(mining_threads, sizeof(thr));
+	mining_thr = (struct thr_info **)calloc(mining_threads, sizeof(thr));
 	if (!mining_thr)
 		quit(1, "Failed to calloc mining_thr");
 	for (i = 0; i < mining_threads; i++) {
@@ -8094,8 +8378,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (opt_benchmark)
-		goto begin_bench;
+	applog(LOG_INFO, "%d gpu miner threads started", gpu_threads);
 
 	/* Set pool state */
 	for (i = 0; i < total_pools; i++) {
@@ -8158,7 +8441,6 @@ int main(int argc, char *argv[])
 		}
 	} while (!pools_active);
 
-begin_bench:
 	total_mhashes_done = 0;
 	for (i = 0; i < total_devices; i++) {
 		struct cgpu_info *cgpu = devices[i];
@@ -8198,6 +8480,14 @@ begin_bench:
 	thr = &control_thr[api_thr_id];
 	if (thr_info_create(thr, NULL, api_thread, thr))
 		quit(1, "API thread create failed");
+
+#ifdef USE_USBUTILS
+	hotplug_thr_id = 6;
+	thr = &control_thr[hotplug_thr_id];
+	if (thr_info_create(thr, NULL, hotplug_thread, thr))
+		quit(1, "hotplug thread create failed");
+	pthread_detach(thr->pth);
+#endif
 
 #ifdef HAVE_CURSES
 	/* Create curses input thread for keyboard input. Create this last so
@@ -8283,13 +8573,6 @@ retry:
 			}
 			gen_stratum_work(pool, work);
 			applog(LOG_DEBUG, "Generated stratum work");
-			stage_work(work);
-			continue;
-		}
-
-		if (opt_benchmark) {
-			get_benchmark_work(work);
-			applog(LOG_DEBUG, "Generated benchmark work");
 			stage_work(work);
 			continue;
 		}

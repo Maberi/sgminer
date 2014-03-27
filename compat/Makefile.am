@@ -1,3 +1,3 @@
 
-SUBDIRS	= jansson-2.5
+SUBDIRS	= jansson-2.5 libusb-1.0
 
