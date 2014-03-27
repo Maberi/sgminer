@@ -994,6 +994,7 @@ extern bool opt_api_listen;
 extern bool opt_api_network;
 extern bool opt_delaynet;
 extern time_t last_getwork;
+extern bool opt_disable_client_reconnect;
 extern bool opt_restart;
 extern bool opt_worktime;
 #ifdef USE_GRIDSEED
@@ -1205,6 +1206,7 @@ struct stratum_work {
 struct pool {
 	int pool_no;
 	char *name;
+	char *coin;
 	int prio;
 	int accepted, rejected;
 	int seq_rejects;

@@ -402,29 +402,22 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 	applog(LOG_DEBUG, "Max mem alloc size is %lu", (long unsigned int)(cgpu->max_alloc));
 
 	/* Create binary filename based on parameters passed to opencl
-	 * compiler to ensure we only load a binary that matches what would
-	 * have otherwise created. The filename is:
-	 * name + kernelname +/- g(offset) + v + vectors + w + work_size + l + sizeof(long) + .bin
-	 * For scrypt the filename is:
-	 * name + kernelname + g + lg + lookup_gap + tc + thread_concurrency + w + work_size + l + sizeof(long) + .bin
+	 * compiler to ensure we only load a binary that matches what
+	 * would have otherwise created. The filename is:
+	 * name + kernelname + g + lg + lookup_gap + tc + thread_concurrency + nf + nfactor + w + work_size + l + sizeof(long) + .bin
 	 */
 	char binaryfilename[255];
 	char filename[255];
-	char numbuf[16];
-	char strbuf[255];
+	char strbuf[32];
 
-	if (strcmp(cgpu->kernelname, "") == 0) {
+	if (cgpu->kernelname == NULL) {
 		applog(LOG_INFO, "No kernel specified, defaulting to ckolivas");
-		strcpy(cgpu->kernelname, "ckolivas");
+		cgpu->kernelname = strdup("ckolivas");
 	}
 
 	sprintf(strbuf, "%s.cl", cgpu->kernelname);
 	strcpy(filename, strbuf);
 	strcpy(binaryfilename, cgpu->kernelname);
-
-	/* Kernel zuikkis only supports lookup-gap 2 */
-	if (strcmp(cgpu->kernelname, "zuikkis") == 0)
-		cgpu->lookup_gap = 2;
 
 	/* For some reason 2 vectors is still better even if the card says
 	 * otherwise, and many cards lie about their max so use 256 as max
@@ -457,6 +450,11 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 		cgpu->lookup_gap = 2;
 	} else
 		cgpu->lookup_gap = cgpu->opt_lg;
+
+	if ((strcmp(cgpu->kernelname, "zuikkis") == 0) && (cgpu->lookup_gap != 2)) {
+		applog(LOG_WARNING, "Kernel zuikkis only supports lookup-gap = 2 (currently %d), forcing.", cgpu->lookup_gap);
+		cgpu->lookup_gap = 2;
+	}
 
 	if (!cgpu->opt_tc) {
 		unsigned int sixtyfours;
@@ -501,13 +499,13 @@ _clState *initCl(unsigned int gpu, char *name, size_t nameSize)
 	if (clState->goffset)
 		strcat(binaryfilename, "g");
 
-	sprintf(numbuf, "lg%utc%unf%u", cgpu->lookup_gap, (unsigned int)cgpu->thread_concurrency, algorithm->nfactor);
-	strcat(binaryfilename, numbuf);
+	sprintf(strbuf, "lg%utc%unf%u", cgpu->lookup_gap, (unsigned int)cgpu->thread_concurrency, algorithm->nfactor);
+	strcat(binaryfilename, strbuf);
 
-	sprintf(numbuf, "w%d", (int)clState->wsize);
-	strcat(binaryfilename, numbuf);
-	sprintf(numbuf, "l%d", (int)sizeof(long));
-	strcat(binaryfilename, numbuf);
+	sprintf(strbuf, "w%d", (int)clState->wsize);
+	strcat(binaryfilename, strbuf);
+	sprintf(strbuf, "l%d", (int)sizeof(long));
+	strcat(binaryfilename, strbuf);
 	strcat(binaryfilename, ".bin");
 
 	binaryfile = fopen(binaryfilename, "rb");
@@ -734,8 +732,8 @@ built:
 	free(binaries);
 	free(binary_sizes);
 
-	applog(LOG_NOTICE, "Initialising kernel %s with%s bitalign, worksize %d",
-	       filename, clState->hasBitAlign ? "" : "out", (int)(clState->wsize));
+	applog(LOG_NOTICE, "Initialising kernel %s with%s bitalign, %spatched BFI",
+	       filename, clState->hasBitAlign ? "" : "out", patchbfi ? "" : "un");
 
 	if (!prog_built) {
 		/* create a cl program executable for all the devices specified */
